@@ -33,13 +33,17 @@ def load_baskets():
     if not required.issubset(df.columns):
         raise ValueError(f"CSV에 필요한 열이 없습니다: {', '.join(sorted(required - set(df.columns)))}")
 
-    baskets = []
-    for menu_string in df["메뉴"].fillna(""):
+    meals = []
+    for date_value, menu_string in zip(df["날짜"], df["메뉴"].fillna("")):
         menus = {clean_menu(item) for item in menu_string.split("|")}
         menus.discard("")
         if menus:
-            baskets.append(menus)
-    return baskets
+            parsed = pd.to_datetime(date_value, format="%Y%m%d", errors="coerce")
+            if pd.isna(parsed):
+                raise ValueError(f"올바르지 않은 급식 날짜: {date_value}")
+            date_label = parsed.strftime("%Y-%m-%d")
+            meals.append((date_label, menus))
+    return meals
 
 
 @st.cache_data
@@ -59,27 +63,67 @@ def calculate_rules(baskets_as_tuples):
             lift = confidence / (menu_counts[result] / n)
             records.append({
                 "조건": condition,
+                "조건 등장": menu_counts[condition],
                 "결과": result,
+                "결과 등장": menu_counts[result],
                 "동시": together,
                 "지지도": support,
                 "신뢰도": confidence,
                 "향상도": lift,
             })
 
-    columns = ["조건", "결과", "동시", "지지도", "신뢰도", "향상도"]
+    columns = ["조건", "조건 등장", "결과", "결과 등장", "동시", "지지도", "신뢰도", "향상도"]
     return pd.DataFrame(records, columns=columns), len(menu_counts), len(pair_counts)
 
 
 try:
-    baskets = load_baskets()
+    meals = load_baskets()
 except Exception as exc:
     st.error("급식 CSV를 불러오지 못했습니다. 주소, 파일 공개 설정, 열 이름을 확인해 주세요.")
     st.exception(exc)
     st.stop()
 
-if not baskets:
+if not meals:
     st.warning("분석할 메뉴가 없습니다.")
     st.stop()
+
+all_dates = sorted(date for date, _ in meals)
+first_date = pd.Timestamp(all_dates[0]).date()
+last_date = pd.Timestamp(all_dates[-1]).date()
+st.subheader("📅 분석 기간 선택")
+date_cols = st.columns(2)
+with date_cols[0]:
+    start_date = st.date_input(
+        "시작일", value=first_date, min_value=first_date, max_value=last_date,
+        format="YYYY-MM-DD",
+    )
+with date_cols[1]:
+    end_date = st.date_input(
+        "종료일", value=last_date, min_value=first_date, max_value=last_date,
+        format="YYYY-MM-DD",
+    )
+
+if start_date > end_date:
+    st.warning("시작일이 종료일보다 늦습니다. 분석 기간을 다시 선택해 주세요.")
+    st.stop()
+
+meals = [(date, menus) for date, menus in meals if start_date.isoformat() <= date <= end_date.isoformat()]
+if not meals:
+    st.info("선택한 기간에는 급식 데이터가 없습니다. 기간을 다시 선택해 주세요.")
+    st.stop()
+
+st.caption(f"분석 대상: {start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d} (시작일·종료일 포함)")
+baskets = [menus for _, menus in meals]
+menu_dates = {
+    menu: sorted({date for date, menus in meals if menu in menus})
+    for menu in {menu for basket in baskets for menu in basket}
+}
+
+
+def date_lines(dates):
+    """Plotly hover를 위해 날짜를 적당한 길이의 여러 줄로 표시합니다."""
+    return "<br>".join(", ".join(dates[i:i + 5]) for i in range(0, len(dates), 5))
+
 
 rules, menu_count, pair_count = calculate_rules(
     tuple(tuple(sorted(basket)) for basket in baskets)
@@ -99,6 +143,15 @@ with sort_col:
     sort_name = st.selectbox("정렬 기준", ["향상도 순", "신뢰도 순", "동시 순"])
 
 if chosen != "전체 메뉴":
+    chosen_days = sum(chosen in basket for basket in baskets)
+    st.markdown(f"**선택한 메뉴: {chosen}**")
+    selected_cols = st.columns(3)
+    selected_cols[0].metric(
+        "메뉴 등장 일수", f"{chosen_days:,}일",
+        help="등장 날짜:\n" + "\n".join(menu_dates[chosen]),
+    )
+    selected_cols[1].metric("전체 급식 일수", f"{len(baskets):,}일")
+    selected_cols[2].metric("메뉴 등장 비율", f"{chosen_days / len(baskets):.1%}")
     rules = rules[(rules["조건"] == chosen) | (rules["결과"] == chosen)].copy()
 
 sort_key = {"향상도 순": "향상도", "신뢰도 순": "신뢰도", "동시 순": "동시"}[sort_name]
@@ -114,6 +167,8 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
     column_config={
+        "조건 등장": st.column_config.NumberColumn("조건 등장", help="조건 메뉴가 나온 급식 일수 (신뢰도의 분모)", format="%d일"),
+        "결과 등장": st.column_config.NumberColumn("결과 등장", help="결과 메뉴가 나온 급식 일수 (향상도 계산에 사용)", format="%d일"),
         "동시": st.column_config.NumberColumn("동시", help="두 메뉴가 함께 등장한 급식 일수", format="%d일"),
         "지지도": st.column_config.NumberColumn("지지도", help="동시 등장 일수 ÷ 전체 급식 일수", format="%.2f"),
         "신뢰도": st.column_config.NumberColumn("신뢰도", help="동시 등장 일수 ÷ 조건 메뉴 등장 일수", format="%.2f"),
@@ -130,14 +185,28 @@ else:
         ascending=[False, False, True, True],
     ).head(10).copy()
     top10["규칙"] = top10["조건"] + " → " + top10["결과"]
+    top10["조건 날짜"] = top10["조건"].map(lambda menu: date_lines(menu_dates[menu]))
+    top10["결과 날짜"] = top10["결과"].map(lambda menu: date_lines(menu_dates[menu]))
+    top10["동시 날짜"] = top10.apply(
+        lambda row: date_lines(sorted(set(menu_dates[row["조건"]]) & set(menu_dates[row["결과"]]))),
+        axis=1,
+    )
     fig = px.bar(
         top10.sort_values("향상도"),
         x="향상도",
         y="규칙",
         orientation="h",
-        hover_data={"동시": True, "지지도": ":.3f", "신뢰도": ":.3f", "향상도": ":.2f"},
+        custom_data=["조건 등장", "결과 등장", "동시", "조건 날짜", "결과 날짜", "동시 날짜"],
         labels={"규칙": "메뉴 규칙", "향상도": "향상도 (Lift)"},
     )
+    fig.update_traces(hovertemplate=(
+        "<b>%{y}</b><br>향상도: %{x:.2f}<br>"
+        "조건 등장: %{customdata[0]}일<br>결과 등장: %{customdata[1]}일<br>"
+        "동시 등장: %{customdata[2]}일<br><br>"
+        "<b>조건 메뉴 등장 날짜</b><br>%{customdata[3]}<br><br>"
+        "<b>결과 메뉴 등장 날짜</b><br>%{customdata[4]}<br><br>"
+        "<b>함께 나온 날짜</b><br>%{customdata[5]}<extra></extra>"
+    ))
     fig.update_layout(height=max(420, len(top10) * 42), margin=dict(l=15, r=15, t=15, b=15))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -145,6 +214,7 @@ with st.expander("지표 해석 방법"):
     st.markdown(
         """
         - **동시**: 두 메뉴가 같은 날 나온 횟수입니다.
+        - **조건 등장 / 결과 등장**: 각 메뉴가 나온 전체 급식 일수입니다. 규칙의 방향을 바꾸면 두 값의 위치도 바뀝니다.
         - **지지도**: 두 메뉴가 함께 나온 날 ÷ 전체 급식 일수입니다.
         - **신뢰도**: 조건 메뉴가 나온 날 중 결과 메뉴도 나온 비율입니다.
         - **향상도**: 신뢰도 ÷ 결과 메뉴가 나온 전체 비율입니다.
